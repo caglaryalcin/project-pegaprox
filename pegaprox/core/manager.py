@@ -820,14 +820,15 @@ class PegaProxManager:
                         from pegaprox.models.tasks import MaintenanceTask
                         t = MaintenanceTask(nm)
                         t.native_ha = True
+                        t._discovered_by_refresh = True
                         t.status = 'completed'
                         t.total_vms = 0
                         self.nodes_in_maintenance[nm] = t
                         self.logger.info(f"[MAINT] Detected native HA maintenance on {nm} (set externally)")
 
-                # cleanup stale entries if someone disabled maintenance outside PegaProx
+                # cleanup stale entries — only ones discovered externally, not ones we set
                 for nm in [n for n, tsk in self.nodes_in_maintenance.items()
-                           if getattr(tsk, 'native_ha', False) and n not in native_ha_nodes]:
+                           if getattr(tsk, '_discovered_by_refresh', False) and n not in native_ha_nodes]:
                     del self.nodes_in_maintenance[nm]
                     self.logger.info(f"[MAINT] {nm} left native HA maintenance")
 
@@ -1522,11 +1523,15 @@ class PegaProxManager:
             task.status = 'completed'
             task.total_vms = 0
             task.migrated_vms = 0
-        elif self._try_native_ha_maintenance(node_name, task):
-            # NS feb 2026 - always try native HA first, it's Proxmox-native not our HA (#78)
-            pass
         else:
-            # Fallback: custom evacuation logic
+            # NS Mar 2026 - set HA maintenance flag first if available, then always evacuate ourselves.
+            # Before we just did "return True" after ha-manager succeeded and assumed PVE handles it,
+            # but PVE HA only migrates HA-managed resources and gives no feedback. So we do both:
+            # 1) tell PVE we're going into maintenance (so it doesn't fence us)
+            # 2) actively evacuate all VMs ourselves (HA-managed or not)
+            if self._try_native_ha_maintenance(node_name, task):
+                self.logger.info(f"[MAINT] HA flag set for {node_name}, now evacuating VMs ourselves")
+            # always run our own evacuation
             t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
             t.daemon = True
             t.start()
@@ -1578,20 +1583,22 @@ class PegaProxManager:
                     if node.get('status') == 'maintenance':
                         native_ha_nodes.add(node['node'])
 
-            # sync into nodes_in_maintenance
+            # sync into nodes_in_maintenance (only add externally detected ones)
             for nm in native_ha_nodes:
                 if nm not in self.nodes_in_maintenance:
                     from pegaprox.models.tasks import MaintenanceTask
                     t = MaintenanceTask(nm)
                     t.native_ha = True
+                    t._discovered_by_refresh = True
                     t.status = 'completed'
                     t.total_vms = 0
                     self.nodes_in_maintenance[nm] = t
                     self.logger.info(f"[MAINT] refresh: detected maintenance on {nm}")
 
-            # cleanup stale
+            # NS Mar 2026 - only clean up nodes that were DISCOVERED by refresh (not ones we put there).
+            # PVE drops the HA maintenance flag fast, but we want to keep tracking until user exits.
             for nm in [n for n, tsk in self.nodes_in_maintenance.items()
-                       if getattr(tsk, 'native_ha', False) and n not in native_ha_nodes]:
+                       if getattr(tsk, '_discovered_by_refresh', False) and n not in native_ha_nodes]:
                 del self.nodes_in_maintenance[nm]
                 self.logger.info(f"[MAINT] refresh: {nm} no longer in maintenance")
 
@@ -1663,10 +1670,8 @@ class PegaProxManager:
 
             if ok:
                 task.native_ha = True
-                task.status = 'completed'
-                task.total_vms = 0
-                task.migrated_vms = 0
-                self.logger.info(f"[MAINT] native HA enabled for {node_name}, Proxmox handles the rest")
+                # don't set completed here — let _evacuate_node handle the actual migration
+                self.logger.info(f"[MAINT] native HA flag set for {node_name}")
                 return True
 
             self.logger.warning(f"[MAINT] native HA failed for {node_name}, falling back")
